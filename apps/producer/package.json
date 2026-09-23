@@ -1,0 +1,17 @@
+{
+  "name": "nexus-intel-producer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Standalone process that replays a local staging pool into the NEXUS INTEL backend's ingestion endpoint to drive the live simulation.",
+  "main": "producer.mjs",
+  "scripts": {
+    "start": "node producer.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

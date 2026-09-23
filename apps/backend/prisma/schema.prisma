@@ -1,0 +1,545 @@
+// NEXUS INTEL — Prisma schema
+
+// (Entities, Alerts, Investigations, Evidence, Network Graph, Wallets,
+// Listings, Audit Log) has a matching real table from day one.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+
+// Editable prompt configuration for LLM-backed features, so the prompt
+// text is a data row an investigator/admin can tune rather than a string
+// buried in application code. `template` supports {{placeholder}} tokens
+// that the calling code fills in (see lib/investigationAssessment.ts).
+model PromptTemplate {
+  id                String   @id @default(cuid())
+  key               String   @unique // e.g. "ai_assessment"
+  systemInstruction String   @db.Text
+  template          String   @db.Text
+  updatedAt         DateTime @updatedAt
+  updatedBy         String?
+}
+
+enum SourceAccess {
+  AUTHORIZED
+  PUBLIC
+  SYNTHETIC
+}
+
+model Source {
+  id       String       @id @default(cuid())
+  name     String       @unique // "Source Alpha", "Blockchain Data", "Demo Stream"
+  type     String       // "Intelligence feed", "Public information", "Blockchain data"
+  access   SourceAccess
+  listings Listing[]
+  evidence EvidenceRecord[]
+  infrastructureIndicators InfrastructureIndicator[]
+}
+
+// ─── Entities & identifiers ─────────────────────────────────────────────────
+// The heart of entity resolution: an Entity is a resolved "person", built
+// from multiple correlated Identifiers, each with its own confidence score.
+
+model Entity {
+  id          String   @id @default(cuid()) // display id e.g. ENT-001 stored separately
+  displayId   String   @unique              // "ENT-001"
+  alias       String
+  risk        Int      @default(0)
+  confidence  Int      @default(0)
+  riskChange  Int      @default(0)
+  firstSeen   DateTime @default(now())
+  lastSeen    DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  identifiers   Identifier[]
+  infrastructureIndicators InfrastructureIndicator[]
+  personaProfiles PersonaProfile[]
+  attributionLinks AttributionLink[] @relation("ActorAttributions")
+  alertLinks    AlertEntity[]
+  graphNode     GraphNode?
+  investigationLinks InvestigationEntity[]
+  events        RiskEvent[]
+  walletTransactions WalletTransaction[]
+  networkId String?
+  network   Network? @relation(fields: [networkId], references: [id])
+}
+
+model Identifier {
+  id         String  @id @default(cuid())
+  type       String  // "Username", "Wallet", "Comm ID", "Email"...
+  value      String
+  confidence Int
+  entityId   String
+  entity     Entity  @relation(fields: [entityId], references: [id], onDelete: Cascade)
+}
+
+
+// ─── Threat-actor de-anonymization intelligence ────────────────────────────
+
+model InfrastructureIndicator {
+  id          String   @id @default(cuid())
+  displayId   String   @unique
+  type        String
+  value       String
+  service     String?
+  confidence  Int      @default(0)
+  firstSeen   DateTime @default(now())
+  lastSeen    DateTime @default(now())
+  metadata    Json?
+  sourceId    String?
+  source      Source?  @relation(fields: [sourceId], references: [id])
+  entityId    String?
+  entity      Entity?  @relation(fields: [entityId], references: [id], onDelete: SetNull)
+}
+
+model PersonaProfile {
+  id                 String   @id @default(cuid())
+  entityId           String
+  entity             Entity   @relation(fields: [entityId], references: [id], onDelete: Cascade)
+  stylometricScore   Int      @default(0)
+  behavioralScore    Int      @default(0)
+  commonPhrases      Json?
+  activityWindow     String?
+  migrationSignals   Json?
+  lastAnalyzedAt     DateTime @default(now())
+}
+
+model AttributionLink {
+  id                 String   @id @default(cuid())
+  actorId            String
+  actor              Entity   @relation("ActorAttributions", fields: [actorId], references: [id], onDelete: Cascade)
+  candidateLabel     String
+  confidence         Int      @default(0)
+  rationale          Json?
+  evidenceSummary    String?  @db.Text
+  status             String   @default("CANDIDATE")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+// ─── Networks (emerging intelligence networks) & risk trajectory ───────────────
+// This backs the early-warning system: a Network's risk is a time series,
+// not a single number, so escalation can be detected.
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model Network {
+  id          String    @id @default(cuid())
+  displayId   String    @unique // "N-042"
+  risk        Int       @default(0)
+  change      Int       @default(0)
+  status      RiskLevel @default(LOW)
+  lastActivity DateTime @default(now())
+  createdAt   DateTime  @default(now())
+
+  entities      Entity[]
+  riskPoints    NetworkRiskPoint[]
+  alerts        Alert[]
+  investigations Investigation[]
+  walletTransactions WalletTransaction[]
+}
+
+// One point in a network's risk-over-time trajectory — this is what powers
+// the "Day 1: 32 -> Day 20: 91" early-warning chart, generated from real
+// RiskEvents rather than a hardcoded array.
+model NetworkRiskPoint {
+  id        String   @id @default(cuid())
+  networkId String
+  network   Network  @relation(fields: [networkId], references: [id], onDelete: Cascade)
+  label     String   // "Day 1", or an ISO date
+  score     Int
+  recordedAt DateTime @default(now())
+}
+
+// A single ingested/processed event that fed into a risk recalculation —
+// this is what the "Live Intelligence Feed" panel streams over WebSocket.
+model RiskEvent {
+  id          String   @id @default(cuid())
+  entityId    String?
+  entity      Entity?  @relation(fields: [entityId], references: [id])
+  type        String   // "listing_detected" | "transaction_detected" | "correlation" | "risk_update" | "alert_generated"
+  description String
+  scoreDelta  Int      @default(0)
+  createdAt   DateTime @default(now())
+}
+
+// ─── Alerts ──────────────────────────────────────────────────────────────
+
+enum AlertStatus {
+  NEW
+  REVIEWED
+  RESOLVED
+}
+
+model Alert {
+  id          String      @id @default(cuid())
+  displayId   String      @unique // "ALT-089"
+  severity    Int
+  title       String
+  reason      String
+  status      AlertStatus @default(NEW)
+  createdAt   DateTime    @default(now())
+
+  networkId   String?
+  network     Network?    @relation(fields: [networkId], references: [id])
+  entities    AlertEntity[]
+}
+
+model AlertEntity {
+  alertId  String
+  entityId String
+  alert    Alert  @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  entity   Entity @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@id([alertId, entityId])
+}
+
+// ─── Investigations ─────────────────────────────────────────────────────────
+
+enum InvestigationStatus {
+  UNDER_INVESTIGATION
+  UNDER_REVIEW
+  MONITORING
+  CLOSED
+}
+
+enum Priority {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+model Investigation {
+  id          String               @id @default(cuid())
+  displayId   String               @unique // "INV-2026-042"
+  title       String
+  description String
+  status      InvestigationStatus  @default(UNDER_INVESTIGATION)
+  priority    Priority
+  assignee    String
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  networkId   String?
+  network     Network?             @relation(fields: [networkId], references: [id])
+
+  entities    InvestigationEntity[]
+  evidence    EvidenceRecord[]
+  evidenceLinks InvestigationEvidence[]
+  timeline    CaseTimelineEvent[]
+  aiAssessments AiAssessment[]
+  notes       InvestigationNote[]
+}
+
+// A single investigator note on a case. Multiple notes per investigation,
+// newest first — each one carries who added it and when, and (if it's ever
+// edited) who last edited it and when. Past versions are preserved in
+// `revisions` below, so an edit never destroys what was there before.
+model InvestigationNote {
+  id              String   @id @default(cuid())
+  investigationId String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  content         String   @db.Text
+  createdBy       String
+  createdAt       DateTime @default(now())
+  updatedBy       String?  // null until the note is edited for the first time
+  updatedAt       DateTime @updatedAt
+
+  revisions       InvestigationNoteRevision[]
+}
+
+// A snapshot of a note's content right before it was overwritten by an
+// edit. Written by the PATCH /notes/:noteId route BEFORE applying the new
+// content, so `content`/`author`/`versionAt` here describe the version that
+// was just replaced — this is what "view edit history" reads from.
+model InvestigationNoteRevision {
+  id       String   @id @default(cuid())
+  noteId   String
+  note     InvestigationNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  content  String   @db.Text
+  author   String   // who wrote this version of the content
+  versionAt DateTime // when this version was created/last touched (its old createdAt/updatedAt)
+  supersededAt DateTime @default(now()) // when this version was replaced by an edit
+}
+
+model InvestigationEntity {
+  investigationId String
+  entityId        String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  entity          Entity        @relation(fields: [entityId], references: [id], onDelete: Cascade)
+
+  @@id([investigationId, entityId])
+}
+
+// AI Assessment: generated FROM structured risk-engine signals, never the
+// other way around. Store the signals alongside the generated text so the
+// explanation is always traceable back to real numbers.
+enum AssessmentReviewStatus {
+  PENDING   // not yet reviewed by an investigator
+  ACCEPTED  // investigator accepted the AI narrative/next-steps as-is
+  MODIFIED  // investigator kept the assessment but edited the text
+  REJECTED  // investigator rejected the AI narrative/next-steps
+}
+
+model AiAssessment {
+  id              String   @id @default(cuid())
+  investigationId String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  riskScore       Int
+  signals         Json     // [{ label, value }]
+  explanation     String   @db.Text
+  recommendedNext String?  @db.Text
+  createdAt       DateTime @default(now())
+
+  // ── Investigator review (Accept / Modify / Reject) ──────────────────────
+  // The original explanation/recommendedNext above are NEVER overwritten —
+  // they stay as the AI actually produced them. When an investigator edits
+  // the text ("Modify"), the edit is stored separately below so there's
+  // always a clean AI-generated-vs-investigator-edited distinction.
+  reviewStatus          AssessmentReviewStatus @default(PENDING)
+  editedExplanation     String?  @db.Text
+  editedRecommendedNext String?  @db.Text
+  reviewNote            String?  @db.Text // optional reason, mainly used on REJECTED
+  reviewedBy            String?
+  reviewedAt            DateTime?
+}
+
+// ─── Evidence ────────────────────────────────────────────────────────────
+
+enum EvidenceStatus {
+  VERIFIED
+  PENDING
+  REJECTED
+}
+
+model EvidenceRecord {
+  id              String         @id @default(cuid())
+  displayId       String         @unique
+  type            String
+  notes           String?
+  hash            String
+  uploadedBy      String
+  status          EvidenceStatus @default(PENDING)
+  createdAt       DateTime       @default(now())
+  ocrText         String?        @db.Text
+  // EXIF/GPS/dimension metadata extracted from the uploaded image (see
+  // lib/imageMetadata.ts). Null for text-only evidence or images with
+  // no readable metadata. Stored as JSON rather than flattened columns
+  // since tag presence varies wildly per image (most have no EXIF at all).
+  imageMetadata   Json?
+  // Suspicion score + sentiment computed from `ocrText` (see
+  // lib/ocrSentiment.ts). Null until ocrText exists and analysis has run.
+  ocrSentiment    Json?
+
+  sourceId        String?
+  source          Source?        @relation(fields: [sourceId], references: [id])
+  investigationId String
+  investigation   Investigation  @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  investigationLinks InvestigationEvidence[]
+}
+
+// Attaches an EXISTING EvidenceRecord to an (additional) Investigation,
+// without transferring ownership and without creating a new EvidenceRecord.
+// This is what Investigation Workspace > "+ Add Evidence" writes to
+// (POST /api/investigations/:displayId/evidence with { evidenceIds }) —
+// deliberately a separate join table rather than reusing
+// EvidenceRecord.investigationId, since that column is a single required
+// FK (one home investigation) and can't represent "the same record is also
+// attached to investigation B" without moving it out of investigation A or
+// duplicating the row (both of which the product spec explicitly rules
+// out). Removing an attachment (DELETE .../evidence/:evidenceId) deletes
+// only this row — never the underlying EvidenceRecord.
+model InvestigationEvidence {
+  investigationId String
+  evidenceId      String
+  investigation   Investigation  @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  evidence        EvidenceRecord @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+  createdAt       DateTime       @default(now())
+
+  @@id([investigationId, evidenceId])
+}
+
+// ─── Wallets & Listings (blockchain + marketplace intelligence) ────────────
+
+model Wallet {
+  id          String   @id @default(cuid())
+  displayId   String   @unique // "WALLET-W1"
+  risk        Int
+  txnCount    Int      @default(0)
+  entityCount Int      @default(0)
+  cluster     String?
+  firstSeen   DateTime @default(now())
+  lastSeen    DateTime @default(now())
+  totalVolume String?  // "4.73 BTC-eq" — kept as display string for demo
+  flagged     Boolean  @default(false)
+  walletTransactions WalletTransaction[]
+}
+
+model Listing {
+  id          String   @id @default(cuid())
+  displayId   String   @unique // "REC-1024"
+  category    String
+  risk        Int
+  signals     Json     // string[] of detected patterns
+  firstSeen   DateTime @default(now())
+  lastSeen    DateTime @default(now())
+  status      String   // "Flagged" | "Under Review" | "Monitoring" | "Clear"
+
+  marketplace String?  // "Hansa" | "Valhalla"
+  vendorAlias String?  // matches Entity.alias for the listing's vendor
+  title       String?  @db.Text
+  priceUsd    Float?
+  shipsFrom   String?
+
+  sourceId    String?
+  source      Source?  @relation(fields: [sourceId], references: [id])
+}
+
+// ─── Network graph (visual relationship map) ────────────────────────────────
+
+enum NodeType {
+  ENTITY
+  MARKET
+  LISTING
+  WALLET
+  COMM
+  TXN
+}
+
+model GraphNode {
+  id       String   @id @default(cuid())
+  label    String
+  type     NodeType
+  risk     Int
+  x        Float
+  y        Float
+
+  entityId String?  @unique
+  entity   Entity?  @relation(fields: [entityId], references: [id])
+
+  edgesFrom GraphEdge[] @relation("EdgeFrom")
+  edgesTo   GraphEdge[] @relation("EdgeTo")
+}
+
+model GraphEdge {
+  id       String    @id @default(cuid())
+  label    String    // "Appeared On", "Transacted With", "Linked To"...
+  fromId   String
+  toId     String
+  from     GraphNode @relation("EdgeFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to       GraphNode @relation("EdgeTo", fields: [toId], references: [id], onDelete: Cascade)
+}
+
+// ─── Case timeline (per-investigation narrative) ────────────────────────────
+
+model CaseTimelineEvent {
+  id              String   @id @default(cuid())
+  investigationId String
+  investigation   Investigation @relation(fields: [investigationId], references: [id], onDelete: Cascade)
+  occurredAt      DateTime
+  label           String   // "Entity Detected", "Early Warning Triggered"...
+  type            String   // "DETECTION" | "ALERT" | "DISCOVERY" | "ESCALATION" | "WARNING" | "ACTION" | "EVIDENCE"
+  source          String
+  agent           String   // "System" | "Investigator A"
+  description     String   @db.Text
+}
+
+// ─── Audit log ───────────────────────────────────────────────────────────
+
+model AuditLogEntry {
+  id        String   @id @default(cuid())
+  user      String
+  action    String
+  resource  String
+  ip        String
+  status    String   @default("Success")
+  type      String   // "read" | "write" | "export" | "admin" | "search" | "system"
+  createdAt DateTime @default(now())
+}
+
+// ─── Users (basic RBAC) ───────────────────────────────────────────────────
+
+enum Role {
+  ADMINISTRATOR
+  INVESTIGATOR
+  ANALYST
+}
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  role      Role     @default(INVESTIGATOR)
+  createdAt DateTime @default(now())
+
+  // ── Auth ────────────────────────────────────────────────────────────────
+  // Argon2id hash (see src/lib/auth.ts) — never the plaintext password.
+  passwordHash String?
+
+  // Basic brute-force protection: incremented on each failed login,
+  // reset on success. When failedLoginAttempts crosses a threshold,
+  // lockedUntil is set and login is refused (even with the right
+  // password) until that time passes — see src/routes/auth.ts.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
+  sessions  Session[]
+}
+
+// A server-side session — the source of truth for "is this user actually
+// logged in right now". Only tokenHash is stored (SHA-256 of the random
+// token that's actually set in the user's cookie); the raw token never
+// touches the database, so a DB leak alone can't be replayed as a valid
+// session. expiresAt is the absolute lifetime cap; lastActiveAt is bumped
+// on each authenticated request and used for the shorter idle timeout —
+// see src/middleware/auth.ts.
+model Session {
+  id           String   @id @default(cuid())
+  tokenHash    String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+  lastActiveAt DateTime @default(now())
+  expiresAt    DateTime
+  ip           String?
+  userAgent    String?
+
+  @@index([userId])
+}
+
+enum TxnDirection {
+  INBOUND
+  OUTBOUND
+}
+
+model WalletTransaction {
+  id          String       @id @default(cuid())
+  walletId    String
+  wallet      Wallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  entityId    String?
+  entity      Entity?      @relation(fields: [entityId], references: [id])
+
+  networkId   String?
+  network     Network?     @relation(fields: [networkId], references: [id])
+
+  direction   TxnDirection
+  amountBtcEq Float
+  occurredAt  DateTime
+  createdAt   DateTime     @default(now())
+}
+
+
