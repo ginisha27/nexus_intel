@@ -17,14 +17,15 @@ services:
       retries: 10
 
   backend:
-    build:
-      context: .
-      dockerfile: apps/backend/Dockerfile
-    restart: unless-stopped
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/nexus_intel
-      NODE_ENV: production
-      PORT: 4000
+  build:
+    context: .
+    dockerfile: apps/backend/Dockerfile
+  restart: unless-stopped
+  environment:
+    DATABASE_URL: postgresql://postgres:postgres@postgres:5432/nexus_intel
+    NODE_ENV: production
+    PORT: 4000
+    INGEST_SECRET_KEY: ${f13ea01e42f20d8a57b734952346eac52dd1da1be40bd6213126d88ee3c68bba}
     ports:
       - "4000:4000"
     depends_on:
